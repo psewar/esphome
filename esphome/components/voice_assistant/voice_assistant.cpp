@@ -25,6 +25,15 @@ static const size_t RING_BUFFER_SIZE = RING_BUFFER_SAMPLES * sizeof(int16_t);
 static const size_t SEND_BUFFER_SAMPLES = 32 * SAMPLE_RATE_HZ / 1000;  // 32ms * 16kHz / 1000ms
 static const size_t SEND_BUFFER_SIZE = SEND_BUFFER_SAMPLES * sizeof(int16_t);
 static const size_t RECEIVE_SIZE = 1024;
+// Wartefenster, bis der Media Player die TTS-Datei geholt, dekodiert und zu
+// spielen begonnen hat. Frueher galten hier dieselben 2000 ms wie fuer den
+// Watchdog unten -- lief der Player laenger an, wurde "noch nicht angefangen"
+// als "fertig" gewertet und das Mikrofon ging mitten in die eigene Antwort auf
+// (home-assistant-voice-pe#621). Auf der Voice PE dauert das Anlaufen ~2,5 s.
+static const uint32_t PLAYBACK_START_TIMEOUT_MS = 15000;
+// Watchdog waehrend laufender Wiedergabe; wird in jedem loop() erneuert.
+static const uint32_t PLAYBACK_STALL_TIMEOUT_MS = 2000;
+
 static const size_t SPEAKER_BUFFER_SIZE = 16 * RECEIVE_SIZE;
 
 // If one microphone channel keeps producing audio while another configured channel produces none for this
@@ -491,7 +500,8 @@ void VoiceAssistant::loop() {
       }
 #endif
       if (playing) {
-        this->start_playback_timeout_();
+        // Wiedergabe laeuft: kurzer Watchdog gegen einen haengenden Player.
+        this->start_playback_timeout_(PLAYBACK_STALL_TIMEOUT_MS);
       }
       break;
     }
@@ -516,6 +526,15 @@ void VoiceAssistant::loop() {
         this->stream_ended_ = false;
 
         this->tts_stream_end_trigger_.trigger();
+      }
+#endif
+#ifdef USE_MEDIA_PLAYER
+      // Gegenstueck zu den Lautsprecher-Pruefungen oben: solange der Media
+      // Player noch ansagt, darf das Mikrofon nicht aufgehen, sonst hoert sich
+      // das Geraet selbst zu.
+      if ((this->speaker_ == nullptr) && (this->media_player_ != nullptr) &&
+          (this->media_player_->state == media_player::MEDIA_PLAYER_STATE_ANNOUNCING)) {
+        break;
       }
 #endif
       if (this->continue_conversation_) {
@@ -754,8 +773,8 @@ void VoiceAssistant::signal_stop_() {
   }
 }
 
-void VoiceAssistant::start_playback_timeout_() {
-  this->set_timeout("playing", 2000, [this]() {
+void VoiceAssistant::start_playback_timeout_(uint32_t timeout_ms) {
+  this->set_timeout("playing", timeout_ms, [this]() {
     this->cancel_timeout("speaker-timeout");
     this->set_state_(State::RESPONSE_FINISHED, State::RESPONSE_FINISHED);
 
@@ -829,7 +848,7 @@ void VoiceAssistant::on_event(const api::VoiceAssistantEventResponse &msg) {
             this->media_player_->make_call().set_media_url(this->tts_response_url_).set_announcement(true).perform();
 
             this->started_streaming_tts_ = true;
-            this->start_playback_timeout_();
+            this->start_playback_timeout_(PLAYBACK_START_TIMEOUT_MS);
 
             tts_url_for_trigger = this->tts_response_url_;
             this->tts_response_url_.clear();  // Reset streaming URL
@@ -897,7 +916,7 @@ void VoiceAssistant::on_event(const api::VoiceAssistantEventResponse &msg) {
 
           this->media_player_->make_call().set_media_url(url).set_announcement(true).perform();
 
-          this->start_playback_timeout_();
+          this->start_playback_timeout_(PLAYBACK_START_TIMEOUT_MS);
         }
         this->started_streaming_tts_ = false;  // Helps indicate reaching the TTS_END stage
 #endif
@@ -1081,7 +1100,8 @@ void VoiceAssistant::on_announce(const api::VoiceAssistantAnnounceRequest &msg) 
         .perform();
     this->continue_conversation_ = msg.start_conversation;
 
-    this->start_playback_timeout_();
+    // Auch hier wird auf den Wiedergabebeginn gewartet, nicht auf ihr Ende.
+    this->start_playback_timeout_(PLAYBACK_START_TIMEOUT_MS);
 
     if (this->continuous_) {
       this->set_state_(State::STOP_MICROPHONE, State::STREAMING_RESPONSE);
