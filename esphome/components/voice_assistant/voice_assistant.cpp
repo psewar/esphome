@@ -25,13 +25,15 @@ static const size_t RING_BUFFER_SIZE = RING_BUFFER_SAMPLES * sizeof(int16_t);
 static const size_t SEND_BUFFER_SAMPLES = 32 * SAMPLE_RATE_HZ / 1000;  // 32ms * 16kHz / 1000ms
 static const size_t SEND_BUFFER_SIZE = SEND_BUFFER_SAMPLES * sizeof(int16_t);
 static const size_t RECEIVE_SIZE = 1024;
-// Wartefenster, bis der Media Player die TTS-Datei geholt, dekodiert und zu
-// spielen begonnen hat. Frueher galten hier dieselben 2000 ms wie fuer den
-// Watchdog unten -- lief der Player laenger an, wurde "noch nicht angefangen"
-// als "fertig" gewertet und das Mikrofon ging mitten in die eigene Antwort auf
-// (home-assistant-voice-pe#621). Auf der Voice PE dauert das Anlaufen ~2,5 s.
+// How long to wait for the media player to fetch, decode and actually start
+// playing the TTS response. This used to share the 2000 ms watchdog below, so a
+// player that took longer to start was indistinguishable from one that had
+// finished: the state machine moved on and, with continue_conversation set,
+// opened the microphone in the middle of the device's own reply
+// (home-assistant-voice-pe#621). Voice PE needs ~2.5 s to start playing.
 static const uint32_t PLAYBACK_START_TIMEOUT_MS = 15000;
-// Watchdog waehrend laufender Wiedergabe; wird in jedem loop() erneuert.
+// Watchdog for a player that stops making progress; re-armed from loop() for as
+// long as playback is running.
 static const uint32_t PLAYBACK_STALL_TIMEOUT_MS = 2000;
 
 static const size_t SPEAKER_BUFFER_SIZE = 16 * RECEIVE_SIZE;
@@ -500,7 +502,7 @@ void VoiceAssistant::loop() {
       }
 #endif
       if (playing) {
-        // Wiedergabe laeuft: kurzer Watchdog gegen einen haengenden Player.
+        // Playback is running: short watchdog against a stalled player.
         this->start_playback_timeout_(PLAYBACK_STALL_TIMEOUT_MS);
       }
       break;
@@ -529,9 +531,9 @@ void VoiceAssistant::loop() {
       }
 #endif
 #ifdef USE_MEDIA_PLAYER
-      // Gegenstueck zu den Lautsprecher-Pruefungen oben: solange der Media
-      // Player noch ansagt, darf das Mikrofon nicht aufgehen, sonst hoert sich
-      // das Geraet selbst zu.
+      // Counterpart to the speaker checks above: while the media player is
+      // still announcing, the microphone must stay shut, otherwise the device
+      // records its own response and answers it.
       if ((this->speaker_ == nullptr) && (this->media_player_ != nullptr) &&
           (this->media_player_->state == media_player::MEDIA_PLAYER_STATE_ANNOUNCING)) {
         break;
@@ -1100,7 +1102,7 @@ void VoiceAssistant::on_announce(const api::VoiceAssistantAnnounceRequest &msg) 
         .perform();
     this->continue_conversation_ = msg.start_conversation;
 
-    // Auch hier wird auf den Wiedergabebeginn gewartet, nicht auf ihr Ende.
+    // Waiting for playback to start here too, not for it to finish.
     this->start_playback_timeout_(PLAYBACK_START_TIMEOUT_MS);
 
     if (this->continuous_) {
